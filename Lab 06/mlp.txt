@@ -1,0 +1,426 @@
+"""
+Multilayer Perceptron implementation (mlp.py)
+- Vectorized NumPy implementation
+- Support for arbitrary hidden layer sizes
+- Activation functions: relu, sigmoid, tanh, softmax
+- Losses: categorical_crossentropy, binary_crossentropy, mse
+- Optimizers: SGD (with momentum), RMSProp, Adam
+- L2 regularization, learning-rate scheduler, early stopping
+- Save / load model
+- Gradient checking utility (finite differences)
+- Example training run using sklearn.datasets (breast_cancer) for binary classification
+
+Usage: import MLP from this file or run directly to see example.
+"""
+
+from __future__ import annotations
+import numpy as np
+import pickle
+from typing import List, Tuple, Callable, Dict, Optional
+
+
+# ----------------------- activations -----------------------
+class Activations:
+    @staticmethod
+    def sigmoid(x):
+        return 1 / (1 + np.exp(-x))
+
+    @staticmethod
+    def sigmoid_deriv(x):
+        s = Activations.sigmoid(x)
+        return s * (1 - s)
+
+    @staticmethod
+    def relu(x):
+        return np.maximum(0, x)
+
+    @staticmethod
+    def relu_deriv(x):
+        return (x > 0).astype(float)
+
+    @staticmethod
+    def tanh(x):
+        return np.tanh(x)
+
+    @staticmethod
+    def tanh_deriv(x):
+        return 1 - np.tanh(x) ** 2
+
+    @staticmethod
+    def softmax(x):
+        # numerically stable softmax
+        x_shifted = x - np.max(x, axis=1, keepdims=True)
+        exp = np.exp(x_shifted)
+        return exp / np.sum(exp, axis=1, keepdims=True)
+
+
+# ----------------------- losses -----------------------
+class Losses:
+    @staticmethod
+    def binary_crossentropy(y_true, y_pred, eps=1e-12):
+        y_pred = np.clip(y_pred, eps, 1 - eps)
+        return -np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
+
+    @staticmethod
+    def binary_crossentropy_grad(y_true, y_pred, eps=1e-12):
+        y_pred = np.clip(y_pred, eps, 1 - eps)
+        return (-(y_true / y_pred) + (1 - y_true) / (1 - y_pred)) / y_true.shape[0]
+
+    @staticmethod
+    def categorical_crossentropy(y_true, y_pred, eps=1e-12):
+        y_pred = np.clip(y_pred, eps, 1 - eps)
+        return -np.mean(np.sum(y_true * np.log(y_pred), axis=1))
+
+    @staticmethod
+    def categorical_crossentropy_grad(y_true, y_pred, eps=1e-12):
+        y_pred = np.clip(y_pred, eps, 1 - eps)
+        return -(y_true / y_pred) / y_true.shape[0]
+
+    @staticmethod
+    def mse(y_true, y_pred):
+        return np.mean((y_true - y_pred) ** 2)
+
+    @staticmethod
+    def mse_grad(y_true, y_pred):
+        return 2 * (y_pred - y_true) / y_true.shape[0]
+
+
+# ----------------------- utilities -----------------------
+
+def one_hot(y: np.ndarray, n_classes: int) -> np.ndarray:
+    y = y.astype(int)
+    out = np.zeros((y.shape[0], n_classes))
+    out[np.arange(y.shape[0]), y] = 1
+    return out
+
+
+def init_weights(n_in: int, n_out: int, method: str = "he") -> np.ndarray:
+    if method == "he":
+        std = np.sqrt(2.0 / n_in)
+    elif method == "glorot":
+        std = np.sqrt(2.0 / (n_in + n_out))
+    else:
+        std = 0.01
+    return np.random.randn(n_in, n_out) * std
+
+
+# ----------------------- MLP class -----------------------
+class MLP:
+    def __init__(self,
+                 layer_sizes: List[int],
+                 activations: List[str],
+                 loss: str = "binary_crossentropy",
+                 lr: float = 1e-3,
+                 weight_init: str = "he",
+                 seed: Optional[int] = None):
+        """
+        layer_sizes: list like [n_inputs, hidden1, hidden2, ..., n_outputs]
+        activations: list of activation names for each non-input layer, length = len(layer_sizes)-1
+        """
+        if seed is not None:
+            np.random.seed(seed)
+        assert len(layer_sizes) - 1 == len(activations), "activations must match number of layers"
+        self.layer_sizes = layer_sizes
+        self.activations = activations
+        self.loss_name = loss
+        self.lr = lr
+        self.params = {}  # weights and biases
+        self.v = {}  # momentum terms / first moment
+        self.s = {}  # second moment for Adam
+        self._init_params(weight_init)
+
+    def _init_params(self, method: str):
+        for i in range(len(self.layer_sizes) - 1):
+            n_in = self.layer_sizes[i]
+            n_out = self.layer_sizes[i + 1]
+            self.params[f"W{i}"] = init_weights(n_in, n_out, method)
+            self.params[f"b{i}"] = np.zeros((1, n_out))
+            self.v[f"W{i}"] = np.zeros_like(self.params[f"W{i}"])
+            self.v[f"b{i}"] = np.zeros_like(self.params[f"b{i}"])
+            self.s[f"W{i}"] = np.zeros_like(self.params[f"W{i}"])
+            self.s[f"b{i}"] = np.zeros_like(self.params[f"b{i}"])
+
+    def _activate(self, x, name: str):
+        if name == "sigmoid":
+            return Activations.sigmoid(x)
+        if name == "relu":
+            return Activations.relu(x)
+        if name == "tanh":
+            return Activations.tanh(x)
+        if name == "softmax":
+            return Activations.softmax(x)
+        raise ValueError(f"Unknown activation {name}")
+
+    def _activate_grad(self, x, name: str):
+        if name == "sigmoid":
+            return Activations.sigmoid_deriv(x)
+        if name == "relu":
+            return Activations.relu_deriv(x)
+        if name == "tanh":
+            return Activations.tanh_deriv(x)
+        # softmax handled with loss derivative
+        raise ValueError(f"No direct derivative for {name}")
+
+    def forward(self, X: np.ndarray) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """Return lists of pre-activations (Zs) and activations (As)"""
+        A = X
+        As = [A]
+        Zs = []
+        for i, act in enumerate(self.activations):
+            W = self.params[f"W{i}"]
+            b = self.params[f"b{i}"]
+            Z = A.dot(W) + b
+            Zs.append(Z)
+            A = self._activate(Z, act)
+            As.append(A)
+        return Zs, As
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        _, As = self.forward(X)
+        out = As[-1]
+        # if last activation was sigmoids for binary, ensure shape
+        if self.activations[-1] == "sigmoid" and out.shape[1] == 1:
+            return out.reshape(-1, 1)
+        return out
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        proba = self.predict_proba(X)
+        if self.activations[-1] == "softmax":
+            return np.argmax(proba, axis=1)
+        if self.activations[-1] == "sigmoid":
+            return (proba >= 0.5).astype(int).reshape(-1)
+        return proba
+
+    def _compute_loss_and_grad(self, y_true, y_pred):
+        # returns loss scalar and dA (gradient of loss wrt output activation)
+        if self.loss_name == "binary_crossentropy":
+            loss = Losses.binary_crossentropy(y_true, y_pred)
+            dA = Losses.binary_crossentropy_grad(y_true, y_pred)
+            return loss, dA
+        if self.loss_name == "categorical_crossentropy":
+            loss = Losses.categorical_crossentropy(y_true, y_pred)
+            # for softmax + categorical_crossentropy, gradient simplifies to (y_pred - y_true)/N
+            dA = (y_pred - y_true) / y_true.shape[0]
+            return loss, dA
+        if self.loss_name == "mse":
+            loss = Losses.mse(y_true, y_pred)
+            dA = Losses.mse_grad(y_true, y_pred)
+            return loss, dA
+        raise ValueError("Unknown loss")
+
+    def _backprop(self, Zs: List[np.ndarray], As: List[np.ndarray], y_true: np.ndarray) -> Dict[str, np.ndarray]:
+        grads = {}
+        y_pred = As[-1]
+        loss, dA = self._compute_loss_and_grad(y_true, y_pred)
+        # iterate layers backwards
+        dA_curr = dA
+        for i in reversed(range(len(self.activations))):
+            act = self.activations[i]
+            Z = Zs[i]
+            A_prev = As[i]
+            W_key = f"W{i}"
+            b_key = f"b{i}"
+            W = self.params[W_key]
+
+            if act == "softmax":
+                # dA_curr already is derivative of loss wrt Z for softmax (we used (y_pred - y_true)/N)
+                dZ = dA_curr
+            elif act == "sigmoid":
+                dZ = dA_curr * Activations.sigmoid_deriv(Z)
+            elif act == "relu":
+                dZ = dA_curr * Activations.relu_deriv(Z)
+            elif act == "tanh":
+                dZ = dA_curr * Activations.tanh_deriv(Z)
+            else:
+                raise ValueError(f"Unknown activation in backprop: {act}")
+
+            dW = A_prev.T.dot(dZ)
+            db = np.sum(dZ, axis=0, keepdims=True)
+            dA_curr = dZ.dot(W.T)
+
+            grads[W_key] = dW
+            grads[b_key] = db
+
+        return loss, grads
+
+    def _apply_grads(self, grads: Dict[str, np.ndarray], batch_size: int, optimizer: str, opt_params: Dict):
+        # supports sgd (momentum), rmsprop, adam
+        if optimizer == "sgd":
+            momentum = opt_params.get("momentum", 0.0)
+            for k, grad in grads.items():
+                if momentum > 0:
+                    self.v[k] = momentum * self.v[k] - (self.lr / batch_size) * grad
+                    self.params[k] += self.v[k]
+                else:
+                    self.params[k] -= (self.lr / batch_size) * grad
+        elif optimizer == "rmsprop":
+            beta = opt_params.get("beta", 0.9)
+            eps = opt_params.get("eps", 1e-8)
+            for k, grad in grads.items():
+                self.s[k] = beta * self.s[k] + (1 - beta) * (grad ** 2)
+                self.params[k] -= (self.lr / batch_size) * grad / (np.sqrt(self.s[k]) + eps)
+        elif optimizer == "adam":
+            beta1 = opt_params.get("beta1", 0.9)
+            beta2 = opt_params.get("beta2", 0.999)
+            eps = opt_params.get("eps", 1e-8)
+            t = opt_params.get("t", 1)
+            for k, grad in grads.items():
+                self.v[k] = beta1 * self.v[k] + (1 - beta1) * grad
+                self.s[k] = beta2 * self.s[k] + (1 - beta2) * (grad ** 2)
+                v_corr = self.v[k] / (1 - beta1 ** t)
+                s_corr = self.s[k] / (1 - beta2 ** t)
+                self.params[k] -= (self.lr / batch_size) * v_corr / (np.sqrt(s_corr) + eps)
+        else:
+            raise ValueError("Unknown optimizer")
+
+    def fit(self,
+            X: np.ndarray,
+            y: np.ndarray,
+            epochs: int = 100,
+            batch_size: int = 32,
+            optimizer: str = "adam",
+            opt_params: Optional[Dict] = None,
+            shuffle: bool = True,
+            val_data: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+            l2: float = 0.0,
+            lr_scheduler: Optional[Callable[[int, float], float]] = None,
+            early_stopping: Optional[Dict] = None,
+            verbose: bool = True):
+        """Train the network. y should be shaped appropriately:
+        - binary_crossentropy: shape (N,) or (N,1)
+        - categorical_crossentropy: one-hot encoded (N, n_classes)
+        """
+        if opt_params is None:
+            opt_params = {}
+        N = X.shape[0]
+        if shuffle:
+            idx = np.arange(N)
+        best_val_loss = np.inf
+        patience = 0
+        t = 1
+        for epoch in range(1, epochs + 1):
+            if shuffle:
+                np.random.shuffle(idx)
+                X = X[idx]
+                y = y[idx]
+            epoch_loss = 0.0
+            for start in range(0, N, batch_size):
+                end = min(start + batch_size, N)
+                Xb = X[start:end]
+                yb = y[start:end]
+                Zs, As = self.forward(Xb)
+                loss, grads = self._backprop(Zs, As, yb)
+                # add L2 regularization gradient
+                if l2 > 0:
+                    for i in range(len(self.activations)):
+                        grads[f"W{i}"] += l2 * self.params[f"W{i}"]
+                    loss += 0.5 * l2 * sum(np.sum(self.params[f"W{i}"] ** 2) for i in range(len(self.activations)))
+                epoch_loss += loss * (Xb.shape[0] / N)
+                # optimizer step
+                opt_params_local = dict(opt_params)
+                if optimizer == "adam":
+                    opt_params_local.setdefault("t", t)
+                self._apply_grads(grads, batch_size=Xb.shape[0], optimizer=optimizer, opt_params=opt_params_local)
+                t += 1
+
+            # learning rate scheduler
+            if lr_scheduler is not None:
+                self.lr = lr_scheduler(epoch, self.lr)
+
+            # validation
+            if val_data is not None:
+                Xv, yv = val_data
+                ypv = self.predict_proba(Xv)
+                val_loss, _ = self._compute_loss_and_grad(yv, ypv)
+            else:
+                val_loss = None
+
+            if verbose:
+                if val_loss is not None:
+                    print(f"Epoch {epoch}/{epochs} - loss: {epoch_loss:.6f} - val_loss: {val_loss:.6f}")
+                else:
+                    print(f"Epoch {epoch}/{epochs} - loss: {epoch_loss:.6f}")
+
+            # early stopping
+            if early_stopping is not None and val_loss is not None:
+                patience_limit = early_stopping.get("patience", 5)
+                min_delta = early_stopping.get("min_delta", 1e-4)
+                if val_loss + min_delta < best_val_loss:
+                    best_val_loss = val_loss
+                    patience = 0
+                    # optionally save best params
+                    best_params = {k: v.copy() for k, v in self.params.items()}
+                else:
+                    patience += 1
+                    if patience >= patience_limit:
+                        print(f"Early stopping at epoch {epoch}")
+                        self.params.update(best_params)
+                        break
+
+        return self
+
+    def save(self, path: str):
+        with open(path, "wb") as f:
+            pickle.dump({
+                "layer_sizes": self.layer_sizes,
+                "activations": self.activations,
+                "params": self.params,
+                "loss_name": self.loss_name
+            }, f)
+
+    @classmethod
+    def load(cls, path: str) -> "MLP":
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        model = cls(obj["layer_sizes"], obj["activations"], loss=obj.get("loss_name", "binary_crossentropy"))
+        model.params = obj["params"]
+        return model
+
+    def gradient_check(self, X: np.ndarray, y: np.ndarray, epsilon: float = 1e-5, tol: float = 1e-6) -> bool:
+        """Numerical gradient checking for parameters. Returns True if gradients are close."""
+        # compute analytical grads on small batch
+        Zs, As = self.forward(X)
+        _, grads = self._backprop(Zs, As, y)
+        # check each param
+        for k, v in self.params.items():
+            numeric_grad = np.zeros_like(v)
+            it = np.nditer(v, flags=["multi_index"], op_flags=["readwrite"])
+            while not it.finished:
+                idx = it.multi_index
+                orig = v[idx]
+                v[idx] = orig + epsilon
+                plus_loss, _ = self._compute_loss_and_grad(y, self.predict_proba(X))
+                v[idx] = orig - epsilon
+                minus_loss, _ = self._compute_loss_and_grad(y, self.predict_proba(X))
+                v[idx] = orig
+                numeric_grad[idx] = (plus_loss - minus_loss) / (2 * epsilon)
+                it.iternext()
+            diff = np.linalg.norm(numeric_grad - grads[k])
+            if diff > tol:
+                print(f"Gradient check failed for {k}: diff={diff}")
+                return False
+        print("Gradient check passed")
+        return True
+
+
+# ----------------------- example -----------------------
+if __name__ == "__main__":
+    # quick example using sklearn breast_cancer for binary classification
+    from sklearn.datasets import load_breast_cancer
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+
+    data = load_breast_cancer()
+    X = data.data
+    y = data.target.reshape(-1, 1)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    model = MLP(layer_sizes=[X_train.shape[1], 64, 16, 1], activations=["relu", "relu", "sigmoid"], loss="binary_crossentropy", lr=1e-3, seed=42)
+    model.fit(X_train, y_train, epochs=50, batch_size=32, optimizer="adam", opt_params={"beta1":0.9, "beta2":0.999, "eps":1e-8}, val_data=(X_test, y_test), l2=1e-4, early_stopping={"patience":6}, verbose=True)
+    preds = model.predict(X_test)
+    acc = np.mean(preds == y_test.reshape(-1))
+    print(f"Test accuracy: {acc:.4f}")
+
